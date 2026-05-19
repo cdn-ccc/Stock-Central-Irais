@@ -918,6 +918,13 @@ input, select, textarea { font-family: inherit; }
   .dashboard-grid {
     grid-template-columns: 1fr;
   }
+  /* New dashboard responsive */
+  [style*="repeat(4, 1fr)"] {
+    grid-template-columns: repeat(2, 1fr) !important;
+  }
+  [style*="3fr 2fr"] {
+    grid-template-columns: 1fr !important;
+  }
 }
 
 @media (max-width: 768px) {

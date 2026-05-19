@@ -5,7 +5,7 @@ import { createClient } from '@/lib/supabase/client'
 import { formatCurrency } from '@/lib/utils'
 import { getStockLevel } from '@/lib/utils'
 import { PRODUCT_STATUS_LABELS } from '@/lib/constants'
-import type { Product, Category } from '@/types'
+import type { Product, Category, ProductImage } from '@/types'
 import {
     Plus,
     Search,
@@ -20,6 +20,15 @@ import {
     Upload,
     Image as ImageIcon,
 } from 'lucide-react'
+
+const MAX_IMAGE_SIZE_MB = 2
+const MAX_IMAGE_SIZE = MAX_IMAGE_SIZE_MB * 1024 * 1024
+
+function getStoragePath(url: string): string | null {
+    const marker = '/product-images/'
+    const idx = url.indexOf(marker)
+    return idx === -1 ? null : url.substring(idx + marker.length)
+}
 
 export default function ProductosPage() {
     const [products, setProducts] = useState<Product[]>([])
@@ -46,6 +55,8 @@ export default function ProductosPage() {
     const [formStatus, setFormStatus] = useState<'active' | 'inactive'>('active')
     const [formFeatured, setFormFeatured] = useState(false)
     const [formImages, setFormImages] = useState<File[]>([])
+    const [existingImages, setExistingImages] = useState<ProductImage[]>([])
+    const [imagesToDelete, setImagesToDelete] = useState<string[]>([])
     const [formError, setFormError] = useState('')
 
     const supabase = createClient()
@@ -63,7 +74,6 @@ export default function ProductosPage() {
         if (!userData) return
         setBusinessId(userData.business_id)
 
-        // Load categories
         const { data: cats } = await supabase
             .from('categories')
             .select('*')
@@ -73,10 +83,9 @@ export default function ProductosPage() {
 
         if (cats) setCategories(cats as Category[])
 
-        // Load products
         let query = supabase
             .from('products')
-            .select('*, category:categories(id, name)')
+            .select('*, category:categories(id, name), images:product_images(id, url, is_primary, sort_order)')
             .eq('business_id', userData.business_id)
             .is('deleted_at', null)
             .order('created_at', { ascending: false })
@@ -103,6 +112,8 @@ export default function ProductosPage() {
         setFormStatus('active')
         setFormFeatured(false)
         setFormImages([])
+        setExistingImages([])
+        setImagesToDelete([])
         setFormError('')
         setEditingProduct(null)
     }
@@ -112,7 +123,7 @@ export default function ProductosPage() {
         setShowModal(true)
     }
 
-    function openEditModal(product: Product) {
+    async function openEditModal(product: Product) {
         setEditingProduct(product)
         setFormName(product.name)
         setFormDescription(product.description || '')
@@ -125,8 +136,30 @@ export default function ProductosPage() {
         setFormStatus(product.status)
         setFormFeatured(product.is_featured)
         setFormImages([])
+        setImagesToDelete([])
         setFormError('')
+
+        const { data: images } = await supabase
+            .from('product_images')
+            .select('*')
+            .eq('product_id', product.id)
+            .order('sort_order')
+        setExistingImages(images || [])
+
         setShowModal(true)
+    }
+
+    function handleImageFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+        if (!e.target.files) return
+        const files = Array.from(e.target.files)
+        const oversized = files.filter(f => f.size > MAX_IMAGE_SIZE)
+        if (oversized.length > 0) {
+            setFormError(`Las imágenes deben pesar menos de ${MAX_IMAGE_SIZE_MB}MB. Archivos rechazados: ${oversized.map(f => f.name).join(', ')}`)
+            e.target.value = ''
+            return
+        }
+        setFormError('')
+        setFormImages(files.slice(0, 5))
     }
 
     async function handleSave(e: React.FormEvent) {
@@ -164,6 +197,45 @@ export default function ProductosPage() {
                     .eq('id', editingProduct.id)
 
                 if (error) throw error
+
+                // Delete flagged images
+                for (const imageId of imagesToDelete) {
+                    const img = existingImages.find(i => i.id === imageId)
+                    if (img) {
+                        const path = getStoragePath(img.url)
+                        if (path) await supabase.storage.from('product-images').remove([path])
+                        await supabase.from('product_images').delete().eq('id', imageId)
+                    }
+                }
+
+                // Upload new images for edit
+                if (formImages.length > 0) {
+                    const remaining = existingImages.filter(i => !imagesToDelete.includes(i.id))
+                    for (let i = 0; i < formImages.length; i++) {
+                        const file = formImages[i]
+                        const ext = file.name.split('.').pop()
+                        const path = `${businessId}/${editingProduct.id}/${Date.now()}_${i}.${ext}`
+                        const { data: uploadData, error: uploadError } = await supabase.storage
+                            .from('product-images')
+                            .upload(path, file)
+
+                        if (uploadError) throw new Error(`Error al subir imagen: ${uploadError.message}`)
+
+                        if (uploadData) {
+                            const { data: { publicUrl } } = supabase.storage
+                                .from('product-images')
+                                .getPublicUrl(uploadData.path)
+
+                            const { error: insertError } = await supabase.from('product_images').insert({
+                                product_id: editingProduct.id,
+                                url: publicUrl,
+                                sort_order: remaining.length + i,
+                                is_primary: remaining.length === 0 && i === 0,
+                            })
+                            if (insertError) throw new Error(`Error al guardar imagen: ${insertError.message}`)
+                        }
+                    }
+                }
             } else {
                 const { data: newProduct, error } = await supabase
                     .from('products')
@@ -186,21 +258,24 @@ export default function ProductosPage() {
                         const file = formImages[i]
                         const ext = file.name.split('.').pop()
                         const path = `${businessId}/${newProduct.id}/${Date.now()}_${i}.${ext}`
-                        const { data: uploadData } = await supabase.storage
+                        const { data: uploadData, error: uploadError } = await supabase.storage
                             .from('product-images')
                             .upload(path, file)
+
+                        if (uploadError) throw new Error(`Error al subir imagen: ${uploadError.message}`)
 
                         if (uploadData) {
                             const { data: { publicUrl } } = supabase.storage
                                 .from('product-images')
                                 .getPublicUrl(uploadData.path)
 
-                            await supabase.from('product_images').insert({
+                            const { error: insertError } = await supabase.from('product_images').insert({
                                 product_id: newProduct.id,
                                 url: publicUrl,
                                 sort_order: i,
                                 is_primary: i === 0,
                             })
+                            if (insertError) throw new Error(`Error al guardar imagen: ${insertError.message}`)
                         }
                     }
                 }
@@ -209,8 +284,8 @@ export default function ProductosPage() {
             setShowModal(false)
             resetForm()
             loadProducts()
-        } catch {
-            setFormError('Error al guardar el producto.')
+        } catch (err) {
+            setFormError(err instanceof Error ? err.message : 'Error al guardar el producto.')
         } finally {
             setSaving(false)
         }
@@ -224,7 +299,6 @@ export default function ProductosPage() {
             .limit(1)
 
         if (saleItems && saleItems.length > 0) {
-            // Soft delete
             await supabase.from('products').update({ deleted_at: new Date().toISOString() }).eq('id', productId)
         } else {
             await supabase.from('products').delete().eq('id', productId)
@@ -239,7 +313,6 @@ export default function ProductosPage() {
         loadProducts()
     }
 
-    // Filtered products
     const filteredProducts = products.filter((p) => {
         if (search) {
             const s = search.toLowerCase()
@@ -247,6 +320,8 @@ export default function ProductosPage() {
         }
         return true
     })
+
+    const visibleExistingImages = existingImages.filter(img => !imagesToDelete.includes(img.id))
 
     return (
         <div>
@@ -324,6 +399,7 @@ export default function ProductosPage() {
                             <tbody>
                                 {filteredProducts.map((product) => {
                                     const stockLevel = getStockLevel(product.stock, product.min_stock)
+                                    const primaryImg = product.images?.find(i => i.is_primary) || product.images?.[0]
                                     return (
                                         <tr key={product.id}>
                                             <td>
@@ -337,8 +413,17 @@ export default function ProductosPage() {
                                                         alignItems: 'center',
                                                         justifyContent: 'center',
                                                         flexShrink: 0,
+                                                        overflow: 'hidden',
                                                     }}>
-                                                        <ImageIcon size={16} style={{ color: 'var(--color-text-tertiary)' }} />
+                                                        {primaryImg ? (
+                                                            <img
+                                                                src={primaryImg.url}
+                                                                alt={product.name}
+                                                                style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                                                            />
+                                                        ) : (
+                                                            <ImageIcon size={16} style={{ color: 'var(--color-text-tertiary)' }} />
+                                                        )}
                                                     </div>
                                                     <div>
                                                         <div style={{ fontWeight: 600 }}>{product.name}</div>
@@ -484,48 +569,86 @@ export default function ProductosPage() {
                                     </label>
                                 </div>
 
-                                {!editingProduct && (
+                                {/* Existing images (edit mode) */}
+                                {editingProduct && visibleExistingImages.length > 0 && (
                                     <div className="input-group">
-                                        <label className="input-label">Imágenes (máx. 5)</label>
-                                        <label style={{
-                                            display: 'flex',
-                                            flexDirection: 'column',
-                                            alignItems: 'center',
-                                            justifyContent: 'center',
-                                            padding: 'var(--space-8)',
-                                            border: '2px dashed var(--color-border)',
-                                            borderRadius: 'var(--radius-md)',
-                                            cursor: 'pointer',
-                                            transition: 'border-color var(--transition-fast)',
-                                        }}>
-                                            <Upload size={24} style={{ color: 'var(--color-text-tertiary)', marginBottom: 'var(--space-2)' }} />
-                                            <span style={{ fontSize: 'var(--font-size-sm)', color: 'var(--color-text-secondary)' }}>
-                                                Haz clic para subir imágenes
-                                            </span>
-                                            <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--color-text-tertiary)' }}>
-                                                JPG, PNG o WebP · Máximo 5MB cada una
-                                            </span>
-                                            <input
-                                                type="file"
-                                                accept="image/jpeg,image/png,image/webp"
-                                                multiple
-                                                style={{ display: 'none' }}
-                                                onChange={(e) => {
-                                                    if (e.target.files) {
-                                                        setFormImages(Array.from(e.target.files).slice(0, 5))
-                                                    }
-                                                }}
-                                            />
-                                        </label>
-                                        {formImages.length > 0 && (
-                                            <div style={{ display: 'flex', gap: 'var(--space-2)', flexWrap: 'wrap', marginTop: 'var(--space-2)' }}>
-                                                {formImages.map((file, i) => (
-                                                    <span key={i} className="badge badge-neutral">{file.name}</span>
-                                                ))}
-                                            </div>
-                                        )}
+                                        <label className="input-label">Imágenes actuales</label>
+                                        <div style={{ display: 'flex', gap: 'var(--space-2)', flexWrap: 'wrap' }}>
+                                            {visibleExistingImages.map((img) => (
+                                                <div key={img.id} style={{ position: 'relative' }}>
+                                                    <img
+                                                        src={img.url}
+                                                        alt=""
+                                                        style={{ width: 72, height: 72, borderRadius: 'var(--radius-sm)', objectFit: 'cover', display: 'block' }}
+                                                    />
+                                                    {img.is_primary && (
+                                                        <span style={{
+                                                            position: 'absolute', bottom: 3, left: 3,
+                                                            fontSize: 9, background: 'rgba(0,0,0,0.65)', color: 'white',
+                                                            padding: '1px 5px', borderRadius: 4, fontWeight: 600,
+                                                        }}>
+                                                            Principal
+                                                        </span>
+                                                    )}
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setImagesToDelete(prev => [...prev, img.id])}
+                                                        style={{
+                                                            position: 'absolute', top: -6, right: -6,
+                                                            width: 20, height: 20, borderRadius: '50%',
+                                                            background: 'var(--color-error)', color: 'white',
+                                                            border: 'none', cursor: 'pointer',
+                                                            display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                                            padding: 0,
+                                                        }}
+                                                    >
+                                                        <X size={10} />
+                                                    </button>
+                                                </div>
+                                            ))}
+                                        </div>
                                     </div>
                                 )}
+
+                                {/* Image upload zone (always visible) */}
+                                <div className="input-group">
+                                    <label className="input-label">
+                                        {editingProduct ? 'Agregar imágenes' : 'Imágenes (máx. 5)'}
+                                    </label>
+                                    <label style={{
+                                        display: 'flex',
+                                        flexDirection: 'column',
+                                        alignItems: 'center',
+                                        justifyContent: 'center',
+                                        padding: 'var(--space-8)',
+                                        border: '2px dashed var(--color-border)',
+                                        borderRadius: 'var(--radius-md)',
+                                        cursor: 'pointer',
+                                        transition: 'border-color var(--transition-fast)',
+                                    }}>
+                                        <Upload size={24} style={{ color: 'var(--color-text-tertiary)', marginBottom: 'var(--space-2)' }} />
+                                        <span style={{ fontSize: 'var(--font-size-sm)', color: 'var(--color-text-secondary)' }}>
+                                            Haz clic para subir imágenes
+                                        </span>
+                                        <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--color-text-tertiary)' }}>
+                                            JPG, PNG o WebP · Máximo {MAX_IMAGE_SIZE_MB}MB cada una
+                                        </span>
+                                        <input
+                                            type="file"
+                                            accept="image/jpeg,image/png,image/webp"
+                                            multiple
+                                            style={{ display: 'none' }}
+                                            onChange={handleImageFileChange}
+                                        />
+                                    </label>
+                                    {formImages.length > 0 && (
+                                        <div style={{ display: 'flex', gap: 'var(--space-2)', flexWrap: 'wrap', marginTop: 'var(--space-2)' }}>
+                                            {formImages.map((file, i) => (
+                                                <span key={i} className="badge badge-neutral">{file.name}</span>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
                             </div>
                             <div className="modal-footer">
                                 <button type="button" className="btn btn-secondary" onClick={() => setShowModal(false)}>Cancelar</button>
